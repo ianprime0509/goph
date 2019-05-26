@@ -1,7 +1,14 @@
+#include <sys/types.h>
+#include <sys/socket.h>
+
 #include <err.h>
+#include <errno.h>
+#include <limits.h>
+#include <netdb.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xft/Xft.h>
@@ -13,7 +20,7 @@ typedef union Arg {
 	double lf;
 } Arg;
 
-/* Control actions */
+/* Control actions - see config.def.h */
 static void page(Arg a);
 static void scroll(Arg a);
 static void scrollto(Arg a);
@@ -79,8 +86,17 @@ static void (*handlers[])(const XEvent *) = {
 /* Utility functions */
 static char *estrdup(const char *);
 
-/* Drawing and window functions */
+/* Network functions */
+static int fetch(int, const char *);
+static int navigate(const char *, const char *, short);
+static int parseurl(const char *, char **, char **, short *);
+
+/* Menu manipulation */
 static void additem(char, const char *, const char *, const char *, short);
+static int addline(const char *);
+static void clearmenu(void);
+
+/* Drawing and window functions */
 static void drawbuf(void);
 static void drawmenu(void);
 static void drawscrollbar(void);
@@ -90,19 +106,22 @@ static void redraw(void);
 static void settitle(const char *);
 static void xinit(void);
 
-static void page(Arg a)
+static void
+page(Arg a)
 {
 	int pagelines = (win.h + linespace) / (win.fnth + linespace);
 
 	scroll((Arg){ .d = pagelines * a.lf });
 }
 
-static void scroll(Arg a)
+static void
+scroll(Arg a)
 {
 	scrollto((Arg){ .d = win.menutop + a.d });
 }
 
-static void scrollto(Arg a)
+static void
+scrollto(Arg a)
 {
 	int oldtop = win.menutop;
 
@@ -185,8 +204,10 @@ motionnotify(const XEvent *ev)
 static void
 expose(const XEvent *ev)
 {
-	USED(ev);
-	redraw();
+	XExposeEvent e = ev->xexpose;
+
+	XCopyArea(win.dpy, win.buf, win.win, win.gc,
+	    e.x, e.y, e.width, e.height, e.x, e.y);
 }
 
 static char *
@@ -197,6 +218,99 @@ estrdup(const char *s)
 	if (!(ret = strdup(s)))
 		err(1, "strdup");
 	return ret;
+}
+
+static int
+fetch(int s, const char *sel)
+{
+	char *req, buf[BUFSIZ], line[512], *bufp;
+	size_t reqlen, linelen = 0;
+	ssize_t got;
+	int retval = 0;
+
+	reqlen = strlen(sel) + 3;
+	req = malloc(reqlen);
+	snprintf(req, reqlen, "%s\r\n", sel);
+	if (send(s, req, reqlen, 0) < (ssize_t)reqlen) {
+		warn("send");
+		retval = 1;
+		goto out;
+	}
+
+	while ((got = recv(s, buf, sizeof(buf), 0)) > 0) {
+		for (bufp = buf; bufp < buf + got; bufp++)
+			if (*bufp == '\r' || *bufp == '\n') {
+				line[linelen] = '\0';
+				if (!strcmp(line, "."))
+					goto out;
+
+				addline(line);
+				linelen = 0;
+				if (*bufp == '\r' && bufp < buf + got - 1 && *(bufp + 1) == '\n')
+					bufp++; /* Skip \n of \r\n sequence */
+			} else if (linelen < sizeof(line) - 1) {
+				line[linelen++] = *bufp;
+			} else {
+				line[linelen] = '\0';
+				warnx("line is too long: %s", line);
+				linelen = 0;
+			}
+	}
+	if (got < 0) {
+		warn("recv");
+		retval = 1;
+	}
+	if (linelen) {
+		line[linelen] = '\0';
+		addline(line);
+	}
+
+out:
+	close(s);
+	return retval;
+}
+
+static int
+navigate(const char *host, const char *sel, short port)
+{
+	char portstr[6], *cause;
+	struct addrinfo hints, *ai, *aip;
+	int err, s, olderrno;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	snprintf(portstr, sizeof(portstr), "%d", port);
+
+	if ((err = getaddrinfo(host, portstr, &hints, &ai))) {
+		warnx("getaddrinfo: %s", gai_strerror(err));
+		return 1;
+	}
+
+	s = -1;
+	for (aip = ai; aip; aip = aip->ai_next) {
+		if ((s = socket(aip->ai_family, aip->ai_socktype, aip->ai_protocol)) < 0) {
+			cause = "socket";
+			continue;
+		}
+		if (connect(s, aip->ai_addr, aip->ai_addrlen) < 0) {
+			cause = "connect";
+			olderrno = errno;
+			close(s);
+			errno = olderrno;
+			continue;
+		}
+		break;
+	}
+	freeaddrinfo(ai);
+
+	if (s < 0) {
+		warn("%s", cause);
+		return 1;
+	}
+
+	return fetch(s, sel);
 }
 
 static void
@@ -216,6 +330,69 @@ additem(char type, const char *name, const char *sel, const char *host, short po
 	i->sel = estrdup(sel);
 	i->host = estrdup(host);
 	i->port = port;
+}
+
+static int
+addline(const char *line)
+{
+	char type;
+	char *linecp, *name, *sel, *host, *portstr;
+	short port;
+	const char *errstr;
+	int retval = 0;
+
+	if (!*line) {
+		warnx("empty line in response");
+		return 1;
+	}
+	type = *line++;
+	linecp = estrdup(line);
+
+	if (!(name = strsep(&linecp, "\t"))) {
+		warnx("no name for item: %s", line);
+		retval = 1;
+		goto out;
+	}
+	if (!(sel = strsep(&linecp, "\t"))) {
+		warnx("no selector for item: %s", line);
+		retval = 1;
+		goto out;
+	}
+	if (!(host = strsep(&linecp, "\t"))) {
+		warnx("no host for item: %s", line);
+		retval = 1;
+		goto out;
+	}
+	if (!(portstr = strsep(&linecp, "\t"))) {
+		warnx("no port for item: %s", line);
+		retval = 1;
+		goto out;
+	}
+	port = strtonum(portstr, 0, SHRT_MAX, &errstr);
+	if (errstr) {
+		warnx("bad port for item: %s", errstr);
+		retval = 1;
+		goto out;
+	}
+
+	additem(type, name, sel, host, port);
+
+out:
+	free(linecp);
+	return retval;
+}
+
+static void
+clearmenu(void)
+{
+	size_t i;
+
+	for (i = 0; i < menu.len; i++) {
+		free(menu.items[i].name);
+		free(menu.items[i].sel);
+		free(menu.items[i].host);
+	}
+	menu.len = 0;
 }
 
 static void
@@ -380,20 +557,13 @@ int
 main(int argc, char **argv)
 {
 	XEvent ev;
-	int i;
-	char tmp[70];
 
 	USED(argc);
 	USED(argv);
 
 	xinit();
 
-	additem('i', "Test info", "sel", "host", 0);
-	additem('i', "Test info line 2", "sel", "host", 0);
-	for (i = 0; i < 50; i++) {
-		snprintf(tmp, sizeof(tmp), "Test item %d", i);
-		additem('1', tmp, "sel", "host", 0);
-	}
+	// navigate("bitreich.org", "", 70);
 	redraw();
 
 	for (;;) {
