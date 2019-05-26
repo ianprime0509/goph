@@ -18,9 +18,11 @@
 typedef union Arg {
 	int d;
 	double lf;
+	const char *s;
 } Arg;
 
 /* Control actions - see config.def.h */
+static void gotourl(Arg a);
 static void page(Arg a);
 static void scroll(Arg a);
 static void scrollto(Arg a);
@@ -85,11 +87,12 @@ static void (*handlers[])(const XEvent *) = {
 
 /* Utility functions */
 static char *estrdup(const char *);
+static char *estrndup(const char *, size_t);
 
 /* Network functions */
 static int fetch(int, const char *);
 static int navigate(const char *, const char *, short);
-static int parseurl(const char *, char **, char **, short *);
+static int parseurl(const char *, char *, char **, char **, short *);
 
 /* Menu manipulation */
 static void additem(char, const char *, const char *, const char *, short);
@@ -105,6 +108,29 @@ static void makecolor(const char *, XftColor *);
 static void redraw(void);
 static void settitle(const char *);
 static void xinit(void);
+
+static void
+gotourl(Arg a)
+{
+	char type, *sel, *host, titlebuf[256];
+	short port;
+
+	if (parseurl(a.s, &type, &sel, &host, &port)) {
+		warnx("invalid URL");
+		return;
+	}
+
+	if (!navigate(sel, host, port)) {
+		if (port != 70)
+			snprintf(titlebuf, sizeof(titlebuf), "%s:%d/%c/%s - goph", host, port, type, sel);
+		else
+			snprintf(titlebuf, sizeof(titlebuf), "%s/%c/%s - goph", host, type, sel);
+		settitle(titlebuf);
+	}
+
+	free(sel);
+	free(host);
+}
 
 static void
 page(Arg a)
@@ -220,6 +246,16 @@ estrdup(const char *s)
 	return ret;
 }
 
+static char *
+estrndup(const char *s, size_t n)
+{
+	char *ret;
+
+	if (!(ret = strndup(s, n)))
+		err(1, "strndup");
+	return ret;
+}
+
 static int
 fetch(int s, const char *sel)
 {
@@ -271,7 +307,7 @@ out:
 }
 
 static int
-navigate(const char *host, const char *sel, short port)
+navigate(const char *sel, const char *host, short port)
 {
 	char portstr[6], *cause;
 	struct addrinfo hints, *ai, *aip;
@@ -299,6 +335,7 @@ navigate(const char *host, const char *sel, short port)
 			olderrno = errno;
 			close(s);
 			errno = olderrno;
+			s = -1;
 			continue;
 		}
 		break;
@@ -311,6 +348,67 @@ navigate(const char *host, const char *sel, short port)
 	}
 
 	return fetch(s, sel);
+}
+
+static int
+parseurl(const char *url, char *type, char **sel, char **host, short *port)
+{
+	size_t hostlen, portlen;
+	int hasport;
+	char typec, *selstr, *hoststr, *portstr;
+	const char *errstr;
+	short portnum;
+
+	if (!strncmp(url, "gopher://", strlen("gopher://")))
+		url += strlen("gopher://");
+
+	hostlen = strcspn(url, ":/");
+	hoststr = estrndup(url, hostlen);
+	url += hostlen;
+
+	hasport = *url == ':';
+	if (hasport) {
+		url++;
+		portlen = strcspn(url, "/");
+		portstr = estrndup(url, portlen);
+		portnum = strtonum(portstr, 0, SHRT_MAX, &errstr);
+		if (errstr) {
+			warnx("invalid port (%s): %s", portstr, errstr);
+			free(hoststr);
+			free(portstr);
+			return 1;
+		}
+		free(portstr);
+		url += portlen;
+	} else {
+		portnum = 70;
+	}
+
+	if (*url)
+		url++;
+	if (*url && url[1] == '/') {
+		typec = *url;
+		url += 2;
+	} else {
+		typec = '1';
+	}
+
+	selstr = estrdup(url);
+
+	if (type)
+		*type = typec;
+	if (sel)
+		*sel = selstr;
+	else
+		free(selstr);
+	if (host)
+		*host = hoststr;
+	else
+		free(hoststr);
+	if (port)
+		*port = portnum;
+
+	return 0;
 }
 
 static void
@@ -370,7 +468,7 @@ addline(const char *line)
 	}
 	port = strtonum(portstr, 0, SHRT_MAX, &errstr);
 	if (errstr) {
-		warnx("bad port for item: %s", errstr);
+		warnx("bad port for item (%s): %s", errstr, line);
 		retval = 1;
 		goto out;
 	}
@@ -556,14 +654,15 @@ xinit(void)
 int
 main(int argc, char **argv)
 {
+	const char *url;
 	XEvent ev;
 
-	USED(argc);
-	USED(argv);
+	if (argc != 2)
+		errx(2, "usage: goph url");
+	url = argv[1];
 
 	xinit();
-
-	// navigate("bitreich.org", "", 70);
+	gotourl((Arg){ .s = url });
 	redraw();
 
 	for (;;) {
