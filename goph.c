@@ -22,10 +22,11 @@ typedef union Arg {
 } Arg;
 
 /* Control actions - see config.def.h */
-static void gotourl(Arg a);
-static void page(Arg a);
-static void scroll(Arg a);
-static void scrollto(Arg a);
+static void gotoselector(Arg /* int */ a);
+static void gotourl(Arg /* const char * */ a);
+static void page(Arg /* double */ a);
+static void scroll(Arg /* int */ a);
+static void scrollto(Arg /* int */ a);
 
 #include "config.h"
 
@@ -86,18 +87,22 @@ static void (*handlers[])(const XEvent *) = {
 };
 
 /* Utility functions */
+static void *emalloc(size_t);
 static char *estrdup(const char *);
 static char *estrndup(const char *, size_t);
 
 /* Network functions */
-static int fetch(int, const char *);
-static int navigate(const char *, const char *, short);
+static int fetch(char, const char *, const char *, short);
 static int parseurl(const char *, char *, char **, char **, short *);
+static int recvcontent(int, int (*)(const char *));
+static int sendreq(int, const char *);
 
 /* Menu manipulation */
 static void additem(char, const char *, const char *, const char *, short);
 static int addline(const char *);
+static int addtextline(const char *);
 static void clearmenu(void);
+static int lineno(int);
 
 /* Drawing and window functions */
 static void drawbuf(void);
@@ -107,12 +112,39 @@ static void makebuf(void);
 static void makecolor(const char *, XftColor *);
 static void redraw(void);
 static void settitle(const char *);
+static void settitleurl(char, const char *, const char *, short);
 static void xinit(void);
+
+static void
+gotoselector(Arg a)
+{
+	char type, *sel, *host;
+	short port;
+
+	if (a.d < 0 || a.d >= (int)menu.len)
+		return;
+
+	type = menu.items[a.d].type;
+	if (type == 'i')
+		return;
+	sel = estrdup(menu.items[a.d].sel);
+	host = estrdup(menu.items[a.d].host);
+	port = menu.items[a.d].port;
+
+	clearmenu();
+	if (!fetch(type, sel, host, port)) {
+		settitleurl(type, sel, host, port);
+		redraw();
+	}
+
+	free(sel);
+	free(host);
+}
 
 static void
 gotourl(Arg a)
 {
-	char type, *sel, *host, titlebuf[256];
+	char type, *sel, *host;
 	short port;
 
 	if (parseurl(a.s, &type, &sel, &host, &port)) {
@@ -120,12 +152,10 @@ gotourl(Arg a)
 		return;
 	}
 
-	if (!navigate(sel, host, port)) {
-		if (port != 70)
-			snprintf(titlebuf, sizeof(titlebuf), "%s:%d/%c/%s - goph", host, port, type, sel);
-		else
-			snprintf(titlebuf, sizeof(titlebuf), "%s/%c/%s - goph", host, type, sel);
-		settitle(titlebuf);
+	clearmenu();
+	if (!fetch(type, sel, host, port)) {
+		settitleurl(type, sel, host, port);
+		redraw();
 	}
 
 	free(sel);
@@ -135,9 +165,7 @@ gotourl(Arg a)
 static void
 page(Arg a)
 {
-	int pagelines = (win.h + linespace) / (win.fnth + linespace);
-
-	scroll((Arg){ .d = pagelines * a.lf });
+	scroll((Arg){ .d = lineno(win.h) * a.lf });
 }
 
 static void
@@ -172,6 +200,8 @@ buttonpress(const XEvent *ev)
 	case Button1:
 		if (insb)
 			page((Arg){ .lf = -(double)e.y / win.h });
+		else
+			gotoselector((Arg){ .d = lineno(e.y) + win.menutop });
 		break;
 	case Button2:
 		if (insb) {
@@ -236,6 +266,16 @@ expose(const XEvent *ev)
 	    e.x, e.y, e.width, e.height, e.x, e.y);
 }
 
+static void *
+emalloc(size_t sz)
+{
+	void *ret;
+
+	if (!(ret = malloc(sz)))
+		err(1, "malloc");
+	return ret;
+}
+
 static char *
 estrdup(const char *s)
 {
@@ -257,61 +297,12 @@ estrndup(const char *s, size_t n)
 }
 
 static int
-fetch(int s, const char *sel)
-{
-	char *req, buf[BUFSIZ], line[512], *bufp;
-	size_t reqlen, linelen = 0;
-	ssize_t got;
-	int retval = 0;
-
-	reqlen = strlen(sel) + 3;
-	req = malloc(reqlen);
-	snprintf(req, reqlen, "%s\r\n", sel);
-	if (send(s, req, reqlen, 0) < (ssize_t)reqlen) {
-		warn("send");
-		retval = 1;
-		goto out;
-	}
-
-	while ((got = recv(s, buf, sizeof(buf), 0)) > 0) {
-		for (bufp = buf; bufp < buf + got; bufp++)
-			if (*bufp == '\r' || *bufp == '\n') {
-				line[linelen] = '\0';
-				if (!strcmp(line, "."))
-					goto out;
-
-				addline(line);
-				linelen = 0;
-				if (*bufp == '\r' && bufp < buf + got - 1 && *(bufp + 1) == '\n')
-					bufp++; /* Skip \n of \r\n sequence */
-			} else if (linelen < sizeof(line) - 1) {
-				line[linelen++] = *bufp;
-			} else {
-				line[linelen] = '\0';
-				warnx("line is too long: %s", line);
-				linelen = 0;
-			}
-	}
-	if (got < 0) {
-		warn("recv");
-		retval = 1;
-	}
-	if (linelen) {
-		line[linelen] = '\0';
-		addline(line);
-	}
-
-out:
-	close(s);
-	return retval;
-}
-
-static int
-navigate(const char *sel, const char *host, short port)
+fetch(char type, const char *sel, const char *host, short port)
 {
 	char portstr[6], *cause;
 	struct addrinfo hints, *ai, *aip;
 	int err, s, olderrno;
+	int (*linehandler)(const char *) = type == '1' ? addline : addtextline;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -347,7 +338,15 @@ navigate(const char *sel, const char *host, short port)
 		return 1;
 	}
 
-	return fetch(s, sel);
+	if (sendreq(s, sel)) {
+		close(s);
+		return 1;
+	}
+	if (recvcontent(s, linehandler)) {
+		close(s);
+		return 1;
+	}
+	return 0;
 }
 
 static int
@@ -385,13 +384,9 @@ parseurl(const char *url, char *type, char **sel, char **host, short *port)
 	}
 
 	if (*url)
-		url++;
-	if (*url && url[1] == '/') {
-		typec = *url;
-		url += 2;
-	} else {
+		typec = *url++;
+	else
 		typec = '1';
-	}
 
 	selstr = estrdup(url);
 
@@ -408,6 +403,60 @@ parseurl(const char *url, char *type, char **sel, char **host, short *port)
 	if (port)
 		*port = portnum;
 
+	return 0;
+}
+
+static int
+recvcontent(int s, int (*linehandler)(const char *))
+{
+	char buf[BUFSIZ], line[512], *bufp;
+	size_t linelen = 0;
+	ssize_t got;
+
+	while ((got = recv(s, buf, sizeof(buf), 0)) > 0) {
+		for (bufp = buf; bufp < buf + got; bufp++)
+			if (*bufp == '\r' || *bufp == '\n') {
+				line[linelen] = '\0';
+				if (!strcmp(line, "."))
+					return 0;
+
+				linehandler(line);
+				linelen = 0;
+				if (*bufp == '\r' && bufp < buf + got - 1 && *(bufp + 1) == '\n')
+					bufp++; /* Skip \n of \r\n sequence */
+			} else if (linelen < sizeof(line) - 1) {
+				line[linelen++] = *bufp;
+			} else {
+				line[linelen] = '\0';
+				warnx("line is too long: %s", line);
+				linelen = 0;
+			}
+	}
+	if (got < 0) {
+		warn("recv");
+		return 1;
+	}
+	if (linelen) {
+		line[linelen] = '\0';
+		linehandler(line);
+	}
+
+	return 0;
+}
+
+static int
+sendreq(int s, const char *sel)
+{
+	char *req;
+	size_t reqlen;
+
+	reqlen = strlen(sel) + 3;
+	req = emalloc(reqlen);
+	snprintf(req, reqlen, "%s\r\n", sel);
+	if (send(s, req, reqlen, 0) < (ssize_t)reqlen) {
+		warn("send");
+		return 1;
+	}
 	return 0;
 }
 
@@ -480,6 +529,13 @@ out:
 	return retval;
 }
 
+static int
+addtextline(const char *line)
+{
+	additem('i', line, "null", "null", 0);
+	return 0;
+}
+
 static void
 clearmenu(void)
 {
@@ -491,6 +547,13 @@ clearmenu(void)
 		free(menu.items[i].host);
 	}
 	menu.len = 0;
+}
+
+static int
+lineno(int y)
+{
+	/* y == win.fnth * pagelines + linespace * (pagelines - 1) + margin */
+	return (y + linespace - margin) / (win.fnth + linespace);
 }
 
 static void
@@ -596,6 +659,17 @@ settitle(const char *title)
 	    XUTF8StringStyle, &prop);
 	XSetWMName(win.dpy, win.win, &prop);
 	XFree(prop.value);
+}
+
+static void
+settitleurl(char type, const char *sel, const char *host, short port)
+{
+	char titlebuf[256];
+	if (port != 70)
+		snprintf(titlebuf, sizeof(titlebuf), "%s:%d/%c%s - goph", host, port, type, sel);
+	else
+		snprintf(titlebuf, sizeof(titlebuf), "%s/%c%s - goph", host, type, sel);
+	settitle(titlebuf);
 }
 
 static void
