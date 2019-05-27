@@ -38,6 +38,7 @@ typedef union Arg {
 } Arg;
 
 /* Control actions - see config.def.h */
+static void back(Arg /* int */ a);
 static void gotoselector(Arg /* int */ a);
 static void gotourl(Arg /* const char * */ a);
 static void page(Arg /* double */ a);
@@ -75,15 +76,16 @@ typedef struct Item {
 
 typedef struct Menu {
 	Item *items;
-	size_t len, cap;
+	size_t len, cap, pos;
 } Menu;
 
 static Win win;
 static Menu menu;
+static Menu hist;
 
 /* Atoms */
-Atom wmprotocols;
-Atom wmdeletewindow;
+static Atom wmprotocols;
+static Atom wmdeletewindow;
 
 /* Event handlers */
 static void buttonpress(const XEvent *);
@@ -108,28 +110,49 @@ static char *estrdup(const char *);
 static char *estrndup(const char *, size_t);
 
 /* Network functions */
-static int fetch(char, const char *, const char *, short);
+static int fetch(const char *, const char *, short, int (*)(Menu *, const char *), Menu *);
+static void fmturl(char *, size_t, char, const char *, const char *, short);
+static int navigate(char, const char *, const char *, short, int);
 static int parseurl(const char *, char *, char **, char **, short *);
-static int recvcontent(int, int (*)(const char *));
+static int recvcontent(int, int (*)(Menu *, const char *), Menu *);
 static int sendreq(int, const char *);
 
 /* Menu manipulation */
-static void additem(char, const char *, const char *, const char *, short);
-static int addline(const char *);
-static int addtextline(const char *);
-static void clearmenu(void);
-static int lineno(int);
+static void menuadd(Menu *, char, const char *, const char *, const char *, short);
+static int menuaddline(Menu *, const char *);
+static int menuaddtextline(Menu *, const char *);
+static void menuclear(Menu *);
+static void menutrunc(Menu *, size_t);
 
 /* Drawing and window functions */
-static void drawbuf(void);
+static void copybuf(void);
 static void drawmenu(void);
 static void drawscrollbar(void);
+static int lineno(int);
 static void makebuf(void);
 static void makecolor(const char *, XftColor *);
 static void redraw(void);
 static void settitle(const char *);
-static void settitleurl(char, const char *, const char *, short);
 static void xinit(void);
+
+static void
+back(Arg a)
+{
+	Item i;
+
+	if (a.d >= 0) {
+		if (hist.pos < (size_t)a.d || hist.pos - a.d >= hist.len)
+			return;
+		hist.pos -= a.d;
+	} else {
+		if (hist.pos - a.d >= hist.len)
+			return;
+		hist.pos -= a.d;
+	}
+
+	i = hist.items[hist.pos];
+	navigate(i.type, i.sel, i.host, i.port, 0);
+}
 
 static void
 gotoselector(Arg a)
@@ -147,11 +170,7 @@ gotoselector(Arg a)
 	host = estrdup(menu.items[a.d].host);
 	port = menu.items[a.d].port;
 
-	clearmenu();
-	if (!fetch(type, sel, host, port)) {
-		settitleurl(type, sel, host, port);
-		redraw();
-	}
+	navigate(type, sel, host, port, 1);
 
 	free(sel);
 	free(host);
@@ -168,11 +187,7 @@ gotourl(Arg a)
 		return;
 	}
 
-	clearmenu();
-	if (!fetch(type, sel, host, port)) {
-		settitleurl(type, sel, host, port);
-		redraw();
-	}
+	navigate(type, sel, host, port, 1);
 
 	free(sel);
 	free(host);
@@ -234,6 +249,12 @@ buttonpress(const XEvent *ev)
 		break;
 	case Button5:
 		scroll((Arg){ .d = 1 });
+		break;
+	case 8:
+		back((Arg){ .d = 1 });
+		break;
+	case 9:
+		back((Arg){ .d = -1 });
 		break;
 	}
 }
@@ -313,12 +334,11 @@ estrndup(const char *s, size_t n)
 }
 
 static int
-fetch(char type, const char *sel, const char *host, short port)
+fetch(const char *sel, const char *host, short port, int (*linehandler)(Menu *, const char *), Menu *m)
 {
 	char portstr[6], *cause;
 	struct addrinfo hints, *ai, *aip;
 	int err, s, olderrno;
-	int (*linehandler)(const char *) = type == '1' ? addline : addtextline;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -358,10 +378,43 @@ fetch(char type, const char *sel, const char *host, short port)
 		close(s);
 		return 1;
 	}
-	if (recvcontent(s, linehandler)) {
+	if (recvcontent(s, linehandler, m)) {
 		close(s);
 		return 1;
 	}
+	return 0;
+}
+
+static void
+fmturl(char *buf, size_t buflen, char type, const char *sel, const char *host, short port)
+{
+	if (port != 70)
+		snprintf(buf, buflen, "%s:%d/%c%s", host, port, type, sel);
+	else
+		snprintf(buf, buflen, "%s/%c%s", host, type, sel);
+}
+
+static int
+navigate(char type, const char *sel, const char *host, short port, int addhist)
+{
+	char buf[256];
+	int (*linehandler)(Menu *, const char *) =
+	    type == '1' ? menuaddline : menuaddtextline;
+
+	menuclear(&menu);
+	if (fetch(sel, host, port, linehandler, &menu))
+		return 1;
+	fmturl(buf, sizeof(buf), type, sel, host, port);
+	settitle(buf);
+
+	if (addhist) {	
+		menutrunc(&hist, hist.pos);
+		menuadd(&hist, type, buf, sel, host, port);
+		hist.pos++;
+	}
+
+	win.menutop = 0;
+	redraw();
 	return 0;
 }
 
@@ -423,7 +476,7 @@ parseurl(const char *url, char *type, char **sel, char **host, short *port)
 }
 
 static int
-recvcontent(int s, int (*linehandler)(const char *))
+recvcontent(int s, int (*linehandler)(Menu *, const char *), Menu *m)
 {
 	char buf[BUFSIZ], line[512], *bufp;
 	size_t linelen = 0;
@@ -436,7 +489,7 @@ recvcontent(int s, int (*linehandler)(const char *))
 				if (!strcmp(line, "."))
 					return 0;
 
-				linehandler(line);
+				linehandler(m, line);
 				linelen = 0;
 				if (*bufp == '\r' && bufp < buf + got - 1 && *(bufp + 1) == '\n')
 					bufp++; /* Skip \n of \r\n sequence */
@@ -454,7 +507,7 @@ recvcontent(int s, int (*linehandler)(const char *))
 	}
 	if (linelen) {
 		line[linelen] = '\0';
-		linehandler(line);
+		linehandler(m, line);
 	}
 
 	return 0;
@@ -477,17 +530,17 @@ sendreq(int s, const char *sel)
 }
 
 static void
-additem(char type, const char *name, const char *sel, const char *host, short port)
+menuadd(Menu *m, char type, const char *name, const char *sel, const char *host, short port)
 {
 	Item *i;
 
-	if (menu.len == menu.cap) {
-		menu.cap = menu.cap ? 2 * menu.cap : 1;
-		if (!(menu.items = reallocarray(menu.items, menu.cap, sizeof(*menu.items))))
+	if (m->len == m->cap) {
+		m->cap = m->cap ? 2 * m->cap : 1;
+		if (!(m->items = reallocarray(m->items, m->cap, sizeof(*m->items))))
 			err(1, "reallocarray");
 	}
 
-	i = &menu.items[menu.len++];
+	i = &m->items[m->len++];
 	i->type = type;
 	i->name = estrdup(name);
 	i->sel = estrdup(sel);
@@ -496,7 +549,7 @@ additem(char type, const char *name, const char *sel, const char *host, short po
 }
 
 static int
-addline(const char *line)
+menuaddline(Menu *m, const char *line)
 {
 	char type;
 	char *linecp, *name, *sel, *host, *portstr;
@@ -538,7 +591,7 @@ addline(const char *line)
 		goto out;
 	}
 
-	additem(type, name, sel, host, port);
+	menuadd(m, type, name, sel, host, port);
 
 out:
 	free(linecp);
@@ -546,34 +599,36 @@ out:
 }
 
 static int
-addtextline(const char *line)
+menuaddtextline(Menu *m, const char *line)
 {
-	additem('i', line, "null", "null", 0);
+	menuadd(m, 'i', line, "null", "null", 0);
 	return 0;
 }
 
 static void
-clearmenu(void)
+menuclear(Menu *m)
 {
-	size_t i;
-
-	for (i = 0; i < menu.len; i++) {
-		free(menu.items[i].name);
-		free(menu.items[i].sel);
-		free(menu.items[i].host);
-	}
-	menu.len = 0;
-}
-
-static int
-lineno(int y)
-{
-	/* y == win.fnth * pagelines + linespace * (pagelines - 1) + margin */
-	return (y + linespace - margin) / (win.fnth + linespace);
+	menutrunc(m, 0);
 }
 
 static void
-drawbuf(void)
+menutrunc(Menu *m, size_t from)
+{
+	size_t i;
+
+	for (i = from; i < m->len; i++) {
+		free(m->items[i].name);
+		free(m->items[i].sel);
+		free(m->items[i].host);
+	}
+	m->len = from;
+
+	if (m->pos >= m->len)
+		m->pos = m->len ? m->len - 1 : 0;
+}
+
+static void
+copybuf(void)
 {
 	XCopyArea(win.dpy, win.buf, win.win, win.gc,
 	    0, 0, win.w, win.h, 0, 0);
@@ -631,6 +686,13 @@ drawscrollbar(void)
 	    scrollwidth - 2, h);
 }
 
+static int
+lineno(int y)
+{
+	/* y == win.fnth * pagelines + linespace * (pagelines - 1) + margin */
+	return (y + linespace - margin) / (win.fnth + linespace);
+}
+
 static void
 makebuf(void)
 {
@@ -663,7 +725,7 @@ redraw(void)
 	if (win.scrollbar)
 		drawscrollbar();
 	drawmenu();
-	drawbuf();
+	copybuf();
 }
 
 static void
@@ -675,17 +737,6 @@ settitle(const char *title)
 	    XUTF8StringStyle, &prop);
 	XSetWMName(win.dpy, win.win, &prop);
 	XFree(prop.value);
-}
-
-static void
-settitleurl(char type, const char *sel, const char *host, short port)
-{
-	char titlebuf[256];
-	if (port != 70)
-		snprintf(titlebuf, sizeof(titlebuf), "%s:%d/%c%s - goph", host, port, type, sel);
-	else
-		snprintf(titlebuf, sizeof(titlebuf), "%s/%c%s - goph", host, type, sel);
-	settitle(titlebuf);
 }
 
 static void
